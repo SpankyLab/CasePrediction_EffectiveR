@@ -1,0 +1,323 @@
+---
+title: "Effective R: LGBM"
+author: "Ryuta Yoshimatsu"
+output:
+  html_document: 
+    number_sections: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message = FALSE}
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(MLmetrics)
+library(lightgbm)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+
+library(TTR)
+library(forecast)
+library(lubridate)
+library(mltools)
+library(data.table)
+library(ggplotify)
+library(gridBase)
+library(tsibble)
+library(fable)
+
+#set.seed(0)
+```
+
+Read the data. 
+
+```{r, fig.width=15, fig.height=7.5, warning = FALSE}
+df <- fread("fitted.csv")
+
+df <- df[, delta_cases := c(0, diff(cases))][]
+df <- df[, trend := c(0, diff(fitted))][]
+df <- df %>% mutate(detrend_delta = delta_cases - trend)
+
+p1 <- ggplot(df, aes(x=time)) + 
+  geom_line(aes(y = cases, color="observed")) + 
+  geom_line(aes(y = fitted, color="fitted")) + 
+  ggtitle("Total Infected Cases") +
+  scale_color_manual(name = "Colors", values = c("observed" = "black", "fitted" = "darkred"))
+
+p2 <- ggplot(df, aes(x=time)) + 
+  geom_line(aes(y = delta_cases, color="observed")) + 
+  geom_line(aes(y = trend, color="fitted")) + 
+  ggtitle("Newly Infected Cases") +
+  scale_color_manual(name = "Colors", values = c("observed" = "black", "fitted" = "darkred"))
+
+p3 <- ggplot(df, aes(x=time)) + 
+  geom_line(aes(y = detrend_delta), color = "black") + 
+  ggtitle("Detrended Newly Infected Cases")
+
+# Create a grid of plots
+grid.arrange(
+  p1, p2, p3,
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+1. Linear combination of three logistic curves does very well at fitting to the total infected cases and estimating the overall trend.
+2. But it does not to capture the seasonality.
+
+```{r, fig.width=7.5, fig.height=7.5}
+detrend_delta.ts <- msts(df$detrend_delta, seasonal.periods=c(7, 30.4167))
+detrend_delta.ts %>% mstl() %>% autoplot()
+```
+
+1. Detrended cases of newly infected incidents has two prominent seasonality components: weekly and monthly. 
+
+We perform regression with ARIMA errors and Fourier terms with base perioicity at 7 and 30.4167 as external regressors. The smoothness of the seasonal pattern are controlled by K (the number of Fourier sin and cos pairs – the seasonal pattern is smoother for smaller values of K). We use AIC to find the optimal K.
+
+```{r, fig.width=15, fig.height=5}
+bestfit <- list(aicc=Inf)
+for(i in 1:3)
+  for(j in 1:5)
+  {
+    fit <- auto.arima(detrend_delta.ts, xreg=fourier(detrend_delta.ts, K=c(i,j)), stationary=FALSE, seasonal=FALSE)
+    if(fit$aicc < bestfit$aicc)
+      bestfit <- fit
+    else break;
+  }
+summary(bestfit)
+```
+
+```{r}
+# Number of days to forecast 
+h <- sum(is.na(df$cases))
+print(h)
+```
+
+```{r, fig.width=12.5, fig.height=5, warning=FALSE, message=FALSE}
+detrend_delta.forecasts <- forecast(bestfit, xreg=fourier(detrend_delta.ts, K=c(3,1), h=h))
+
+par(mfrow=c(1, 2))
+
+plot(bestfit$x, col="black", xlab="time", ylab="detrend_delta")
+lines(fitted(bestfit), col="darkred")
+legend(2, -2000, legend=c("observed", "fitted"), col=c("black", "darkred"), lty=1:1, cex=1)
+plot.new()
+
+vps <- baseViewports()
+pushViewport(vps$figure)        ## I am in the space of the base plot
+vp1 <- plotViewport(c(1,1,1,1))  ## Create new vp with margins
+f <- autoplot(detrend_delta.forecasts) + autolayer(detrend_delta.forecasts$mean, series="Forecasts") + xlim(10, 13.5)
+print(f, vp=vp1)
+```
+
+```{r}
+seasonal <- append(data.frame(fitted(bestfit))[1:(length(fitted(bestfit))-h),], data.frame(detrend_delta.forecasts$mean)[1:h,])
+df <- cbind(df, seasonal)
+df <- df %>% mutate(predicted = trend + seasonal)
+```
+
+```{r, fig.width=7.5, fig.height=5, warning=FALSE, message=FALSE}
+ggplot(df, aes(x=time)) + 
+  xlim(2020.5, 2021.2) +
+  geom_line(aes(y=delta_cases, color="observed")) + 
+  geom_line(data=tail(df, h), aes(x=time, y=predicted, color="predicted")) +
+  scale_color_manual(name = "Colors", values = c("observed"="black", "predicted"="darkred"))
+```
+
+(Compare this prediction with currently available number of cases and uplift if smaller.)
+
+```{r}
+estimated_R <- read.csv(url("https://raw.githubusercontent.com/covid-19-Re/dailyRe-Data/master/CHE-estimates.csv"))
+estimated_R <- estimated_R %>% group_by(date) %>% summarise(mean_R = mean(median_R_mean))
+estimated_R$date <- as.Date(estimated_R$date, "%Y-%m-%d")
+estimated_R <- estimated_R[which(estimated_R$date >= as.Date('2020-02-25', "%Y-%m-%d")), ]
+mean_R <- estimated_R$mean_R
+for (i in (length(mean_R)+1):(length(df$time)))
+  mean_R[i] <- NA
+```
+
+```{r}
+df <- cbind(df, mean_R)
+```
+
+```{r, fig.width=7.5, fig.height=5, warning=FALSE, message=FALSE}
+coefficient <- 2500
+ggplot(df, aes(x=time)) + 
+  geom_line(aes(y=delta_cases, colour='darkblue'), color='black') + 
+  geom_line(aes(y=mean_R*coefficient, colour='darkred'), color='darkred') + 
+  scale_y_continuous(name="delta_cases", sec.axis = sec_axis(~.*1./coefficient, name="mean_R")) +
+  scale_color_discrete(name="", labels=c("delta_cases", "mean_R"))
+```
+
+```{r}
+correlation_df <- df %>% select(delta_cases, mean_R)
+correlation_df <- correlation_df[complete.cases(correlation_df), ]
+cat('correlation between number of cases and effective R: ', cor(correlation_df$delta_cases, correlation_df$mean_R))
+```
+
+Interestingly, the correlation between R and new cases is -0.25. This says that there is no strong 'linear' correlation between the two variables. But, since R is the rate of exponential growth in the ODE of any transmission models, I would expect there is a strong positive relationship between the first order derivative of new cases and R.  
+
+Prepare the training data table.
+
+```{r}
+# Prepare training data table
+X <- df %>% select(time, delta_cases, mean_R)
+X <- X  %>% rename(cases = delta_cases, R = mean_R)
+```
+
+Function to create lagged and rolling window features.
+
+```{r}
+create_features <- function(dt) {
+  
+  # Add lag vectors: table must be sorted by date!
+  lags <- c(7, 28) 
+  
+  R_lag_cols <- paste0("R_lag_", lags) # R_lag_7 and R_lag_28
+  dt[, (R_lag_cols) := shift(.SD, lags), .SDcols="R"]
+  
+  cases_lag_cols <- paste0("cases_lag_", lags) # cases_lag_7 and cases_lag_28
+  dt[, (cases_lag_cols) := shift(.SD, lags), .SDcols="cases"]
+  
+  # Add rolling window vectors: table must be sorted by date!
+  windows <- c(7, 28)
+  
+  R_roll_cols <- paste0("R_rmean_", t(outer(lags, windows, paste, sep="_")))
+  dt[, (R_roll_cols) := frollmean(.SD, windows, na.rm=TRUE), .SDcols=R_lag_cols] # Rolling features on lag_cols
+  
+  cases_roll_cols <- paste0("cases_rmean_", t(outer(lags, windows, paste, sep="_")))
+  dt[, (cases_roll_cols) := frollmean(.SD, windows, na.rm=TRUE), .SDcols=cases_lag_cols] # Rolling features on lag_cols
+
+  return(dt)
+}
+```
+
+```{r}
+X <- create_features(X)
+X <- na.omit(X)
+```
+
+```{r}
+# Split the training data set into train and eval:
+#     train consists of data from "2020-02-25" to 14 days prior to the last record available in X
+#     val  consists of data from the last 14 days of X
+
+# Indexes for the training set
+idx <- c(1:(length(X$time)-14))
+
+# Labels for the training set
+y <- X$R
+
+# Drop columns "time" and "R"
+X[, c("time", "R") := NULL]
+```
+
+Convert a data frame to a numeric matrix: return the matrix obtained by converting all the variables in a data frame to numeric mode and then binding them together as the columns of a matrix.
+
+```{r}
+X <- data.matrix(X)
+```
+
+```{r}
+# Construct lgb dataset
+xtrain <- lgb.Dataset(X[idx, ], label=y[idx]) 
+xval <- lgb.Dataset(X[-idx, ], label=y[-idx])
+```
+
+We use Poisson regression (from generalize linear model family), which is suitable for counts. The model assumes the errors are Poission distributed and thus could capture a skew, discrete distribution, and the restriction to response variables to be non-negative is applied.
+
+```{r}
+# Configure lgb hyper parameters 
+p <- list(objective = "poisson",  # Training parameter
+          metric ="rmse",         # Training parameter
+          force_row_wise = TRUE,  # Training parameter: force row-wise histogram building
+          learning_rate = 0.075,  # Training parameter
+          num_leaves = 34,        # Regularization parameter
+          min_data = 10,          # Regularization parameter
+          sub_feature = 0.8,      # Regularization parameter
+          sub_row = 0.75,         # Regularization parameter
+          bagging_freq = 1,       # Regularization parameter
+          lambda_l2 = 0.1,        # Regularization parameter
+          nthread = 2)            # Training parameter
+
+model.lgb <- lgb.train(params = p,
+                   data = xtrain,
+                   nrounds = 500,               # Training parameter (max number of trees)
+                   valids = list(val = xval),
+                   early_stopping_rounds = 100, # Training parameter (min number of trees to stop)
+                   eval_freq = 50)             # Training parameter
+```
+
+```{r}
+cat("Best rmse on the validation set:", model.lgb$best_score, "at", model.lgb$best_iter, "iteration")
+```
+
+```{r}
+imp <- lgb.importance(model.lgb)
+imp[order(-Gain)
+    ][1:13, ggplot(.SD, aes(reorder(Feature, Gain), Gain)) +
+        geom_col(fill = "darkblue") +
+        xlab("Feature") +
+        coord_flip() +
+        theme_minimal()]
+```
+
+As we are using lag features we have to forecast day by day in order to use the latest predictions for the current day.
+
+```{r}
+# Loop from (today - h) to today
+tday <- Sys.Date()
+fday <- tday - h + 1
+count <- 1
+
+for (day in as.list(seq(fday, tday, by="day")))
+{
+  # Take the subset of the data set only necessary for calculating lagged and rolling mean features for the day
+  X.subset <- df
+  if (count != h){
+    X.subset <- head(X.subset, -(h-count))
+  }else{}
+  X.subset$delta_cases[is.na(X.subset$delta_cases)] <- X.subset$predicted[is.na(X.subset$delta_cases)]
+  X.subset <- X.subset %>% select(time, delta_cases, mean_R)
+  X.subset <- X.subset  %>% rename(cases=delta_cases, R=mean_R)
+  insert_row <- length(X.subset$cases)
+  
+  # Create features
+  X.subset <- create_features(X.subset)
+  
+  # Construct a matrix only with the 'day'
+  X.subset <- tail(X.subset, n=1)
+  X.subset[, c("time", "R") := NULL]
+  X.subset <- data.matrix(X.subset)
+  
+  # Update mean_R column of df
+  R_prediction <- predict(model.lgb, X.subset)
+  
+  df$mean_R[insert_row] <- R_prediction
+  
+  cat(as.character(day),'\t', 'Predicted R ', R_prediction,'\n')
+  count <- count + 1
+}
+```
+
+```{r, fig.width=7.5, fig.height=5, warning=FALSE}
+ggplot(df, aes(x=time)) + 
+  geom_line(data = head(df, n=-h), aes(x=time, y=mean_R, color='historical'), color='black') + 
+  geom_line(data = tail(df, n=h), aes(x=time, y=mean_R, color='predicted'), color='darkred') +
+  geom_hline(yintercept=1.0, color='darkblue') +
+  xlim(2020.5, 2021.2) +
+  ylim(0.5, 1.85) +
+  xlab("Time") +
+  ylab("Estimated R")
+```
